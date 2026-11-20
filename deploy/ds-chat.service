@@ -1,0 +1,44 @@
+[Unit]
+Description=DS Chat - single-user DeepSeek web chat
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dschat
+Group=dschat
+WorkingDirectory=/opt/ds-chat/backend
+EnvironmentFile=/etc/ds-chat.env
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/opt/ds-chat/venv/bin/uvicorn server:app \
+    --host 127.0.0.1 \
+    --port 8787 \
+    --workers 1 \
+    --proxy-headers \
+    --forwarded-allow-ips=127.0.0.1 \
+    --no-access-log
+
+Restart=always
+RestartSec=3
+
+StateDirectory=ds-chat
+StateDirectoryMode=0700
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ds-chat
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+
+MemoryMax=256M
+TasksMax=64
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

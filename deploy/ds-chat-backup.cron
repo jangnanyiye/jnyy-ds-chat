@@ -1,0 +1,4 @@
+# /etc/cron.d/ds-chat-backup
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+17 3 * * * root /opt/ds-chat/venv/bin/python /opt/ds-chat/scripts/backup.py >> /var/log/ds-chat-backup.log 2>&1
