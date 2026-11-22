@@ -136,9 +136,12 @@ def test_search_finds_all_branches(tmp_path: Path):
     new_user, _ = created
     db.add_message(conversation["id"], "assistant", "新回答", parent_id=new_user["id"])
 
-    assert db.search("苹果")[0]["conversation_title"] == "苹果计划"
-    assert db.search("橙子")[0]["message_id"] == new_user["id"]
-    old_matches = db.search("香蕉")
+    results, has_more = db.search("苹果")
+    assert results[0]["conversation_title"] == "苹果计划"
+    assert has_more is False
+    branch_results, _ = db.search("橙子")
+    assert branch_results[0]["message_id"] == new_user["id"]
+    old_matches, _ = db.search("香蕉")
     assert old_matches
     assert old_matches[0]["message_id"] == old_user["id"]
 

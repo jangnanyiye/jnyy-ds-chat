@@ -14,10 +14,11 @@ import {
   Loader2,
   Paperclip,
   Pencil,
+  Quote as QuoteIcon,
   Square,
   X,
 } from 'lucide-react';
-import type { Attachment } from '../types';
+import type { Attachment, Message } from '../types';
 
 const ACCEPT =
   '.jpg,.jpeg,.png,.gif,.webp,.pdf,.doc,.docx,.ppt,.pptx,.txt,.md,.markdown,.csv,.json,.xlsx,.xls,.epub,.mobi,image/*';
@@ -37,8 +38,10 @@ export function Composer({
   onToggleDeepThinking,
   attachments,
   uploadingFiles,
+  quotedMessages,
   onAddFiles,
   onRemoveAttachment,
+  onRemoveQuote,
   maxAttachments,
 }: {
   value: string;
@@ -55,13 +58,16 @@ export function Composer({
   onToggleDeepThinking: (enabled: boolean) => void;
   attachments: Attachment[];
   uploadingFiles: { id: string; name: string }[];
+  quotedMessages: Message[];
   onAddFiles: (files: File[]) => void;
   onRemoveAttachment: (attachmentId: string) => void;
+  onRemoveQuote: (messageId: number) => void;
   maxAttachments: number;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
+  const canSend = Boolean(value.trim()) || (!editing && attachments.length > 0);
 
   useEffect(() => {
     const element = textareaRef.current;
@@ -71,7 +77,11 @@ export function Composer({
   }, [value]);
 
   useEffect(() => {
-    if (!streaming && !disabled) textareaRef.current?.focus();
+    if (streaming || disabled) return;
+    // 移动端不自动聚焦，避免每次生成结束都弹出软键盘打断阅读。
+    const isTouch = window.matchMedia('(pointer: coarse)').matches;
+    const isNarrow = window.matchMedia('(max-width: 900px)').matches;
+    if (!isTouch && !isNarrow) textareaRef.current?.focus();
   }, [streaming, disabled, editing]);
 
   const handleFileInput = (event: ChangeEvent<HTMLInputElement>) => {
@@ -141,6 +151,36 @@ export function Composer({
         </div>
       )}
 
+      {quotedMessages.length > 0 && (
+        <div className="quote-strip">
+          <div className="quote-strip-head">
+            <QuoteIcon size={13} />
+            <span>引用的上下文</span>
+            <small>{quotedMessages.length}/8</small>
+          </div>
+          <div className="quote-strip-list">
+            {quotedMessages.map((message) => (
+              <div className="quote-chip" key={message.id}>
+                <span className="quote-chip-role">
+                  {message.role === 'user' ? '用户' : '回答'}
+                </span>
+                <span className="quote-chip-text">
+                  {message.content.replace(/\s+/g, ' ').trim().slice(0, 80)}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => onRemoveQuote(message.id)}
+                  aria-label="移除引用"
+                  disabled={streaming}
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {(attachments.length > 0 || uploadingFiles.length > 0) && (
         <div className="attachment-strip">
           {attachments.map((attachment) => (
@@ -198,6 +238,7 @@ export function Composer({
           placeholder={editing ? '编辑消息…' : '给 DeepSeek 发送消息'}
           rows={1}
           maxLength={32000}
+          enterKeyHint="send"
           disabled={disabled}
           aria-label="消息输入框"
         />
@@ -246,7 +287,7 @@ export function Composer({
               type="button"
               className="send-btn"
               onClick={onSend}
-              disabled={disabled || !value.trim() || uploadingFiles.length > 0}
+              disabled={disabled || !canSend || uploadingFiles.length > 0}
               aria-label="发送消息"
             >
               <ArrowUp size={19} strokeWidth={2.4} />
@@ -254,7 +295,6 @@ export function Composer({
           )}
         </div>
       </div>
-      <p className="composer-note">AI 生成内容仅供参考，请自行核实重要信息。</p>
     </div>
   );
 }

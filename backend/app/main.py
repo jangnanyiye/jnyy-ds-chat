@@ -13,7 +13,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.background import BackgroundTask
@@ -27,7 +27,7 @@ from .auth import (
     verify_session,
 )
 from .config import LEGACY_MODEL_ALIASES, Settings, load_settings
-from .db import Database, now_ms
+from .db import Database, now_ms, parse_quotes
 from .deepseek import (
     StreamChunk,
     UpstreamError,
@@ -111,25 +111,44 @@ class LoginIn(BaseModel):
     password: str = Field(min_length=1, max_length=512)
 
 
+class PromptIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    name: str = Field(min_length=1, max_length=60)
+    content: str = Field(min_length=1, max_length=12_000)
+
+
+class PromptPatchIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    name: str | None = Field(default=None, min_length=1, max_length=60)
+    content: str | None = Field(default=None, min_length=1, max_length=12_000)
+
+
 class ConversationCreateIn(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     title: str | None = Field(default=None, max_length=120)
     model: str | None = None
+    system_prompt_id: int | None = None
+    single_turn: bool = False
 
 
 class ConversationPatchIn(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     title: str | None = Field(default=None, max_length=120)
     model: str | None = None
+    system_prompt_id: int | None = None
+    single_turn: bool | None = None
 
 
 class ChatIn(BaseModel):
     conversation_id: int | None = None
-    content: str = Field(min_length=1, max_length=32_000)
+    content: str = Field(default="", max_length=32_000)
     model: str = "deepseek-v4-pro"
     web_search: bool = False
     thinking: bool = False
     attachment_ids: list[str] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
+    system_prompt_id: int | None = None
+    single_turn: bool = False
+    quoted_message_ids: list[int] = Field(default_factory=list, max_length=8)
 
 
 class RegenerateIn(BaseModel):
@@ -144,6 +163,7 @@ class EditMessageIn(BaseModel):
     web_search: bool = False
     thinking: bool = False
     attachment_ids: list[str] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
+    quoted_message_ids: list[int] = Field(default_factory=list, max_length=8)
 
 
 def make_title(text: str, limit: int = 28) -> str:
@@ -221,6 +241,67 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # 联网工具和文件输入只在 deepseek-flash 上可用。
             model = "deepseek-flash"
         return model
+
+    def get_prompt_or_400(prompt_id: int | None) -> dict[str, Any] | None:
+        if prompt_id is None:
+            return None
+        prompt = db.get_prompt(prompt_id)
+        if not prompt:
+            raise HTTPException(status_code=400, detail="系统提示词不存在")
+        return prompt
+
+    def build_quotes(
+        conversation_id: int, quoted_message_ids: list[int]
+    ) -> list[dict[str, Any]]:
+        unique_ids = list(dict.fromkeys(quoted_message_ids))
+        if len(unique_ids) > 8:
+            raise HTTPException(status_code=400, detail="最多引用 8 条消息")
+        if not unique_ids:
+            return []
+        rows = db.get_messages_by_ids(conversation_id, unique_ids)
+        if len(rows) != len(unique_ids):
+            raise HTTPException(status_code=400, detail="引用消息不存在")
+        quotes: list[dict[str, Any]] = []
+        total_chars = 0
+        for message_id in unique_ids:
+            row = rows[message_id]
+            content = str(row["content"]).strip()
+            if not content:
+                continue
+            if len(content) > 6_000:
+                content = content[:6_000].rstrip() + "…"
+            total_chars += len(content)
+            if total_chars > 16_000:
+                raise HTTPException(
+                    status_code=400, detail="引用内容过长，请减少引用条数"
+                )
+            quotes.append(
+                {
+                    "id": int(row["id"]),
+                    "role": str(row["role"]),
+                    "content": content,
+                }
+            )
+        return quotes
+
+    def build_context(
+        conversation: dict[str, Any], leaf_id: int
+    ) -> list[dict[str, Any]]:
+        context = db.get_context(
+            int(conversation["id"]),
+            settings.max_context_chars,
+            leaf_id=leaf_id,
+            single_turn=bool(conversation.get("single_turn")),
+        )
+        prompt_text = str(conversation.get("system_prompt_text") or "").strip()
+        prompt_id = conversation.get("system_prompt_id")
+        if not prompt_text and prompt_id is not None:
+            prompt = db.get_prompt(int(prompt_id))
+            if prompt:
+                prompt_text = str(prompt["content"]).strip()
+        if prompt_text:
+            context.insert(0, {"role": "system", "content": prompt_text})
+        return context
 
     def validate_attachment_ids(attachment_ids: list[str]) -> list[str]:
         unique_ids = list(dict.fromkeys(attachment_ids))
@@ -443,19 +524,70 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"ok": True}
 
     # ------------------------------------------------------------------
+    # system prompt library
+    # ------------------------------------------------------------------
+
+    @app.get("/api/prompts")
+    async def list_prompts(_: None = Depends(require_auth)):
+        return {"prompts": db.list_prompts()}
+
+    @app.post("/api/prompts")
+    async def create_prompt(payload: PromptIn, _: None = Depends(require_auth)):
+        name = payload.name.strip()
+        content = payload.content.strip()
+        if not name or not content:
+            raise HTTPException(status_code=400, detail="名称和内容不能为空")
+        prompt = db.create_prompt(name, content)
+        return {"prompt": prompt}
+
+    @app.patch("/api/prompts/{prompt_id}")
+    async def update_prompt(
+        prompt_id: int, payload: PromptPatchIn, _: None = Depends(require_auth)
+    ):
+        if not db.get_prompt(prompt_id):
+            raise HTTPException(status_code=404, detail="系统提示词不存在")
+        name = payload.name.strip() if payload.name is not None else None
+        content = payload.content.strip() if payload.content is not None else None
+        if name == "" or content == "":
+            raise HTTPException(status_code=400, detail="名称和内容不能为空")
+        prompt = db.update_prompt(
+            prompt_id,
+            name=name,
+            content=content,
+        )
+        if not prompt:
+            raise HTTPException(status_code=404, detail="系统提示词不存在")
+        return {"prompt": prompt}
+
+    @app.delete("/api/prompts/{prompt_id}")
+    async def delete_prompt(prompt_id: int, _: None = Depends(require_auth)):
+        if not db.delete_prompt(prompt_id):
+            raise HTTPException(status_code=404, detail="系统提示词不存在")
+        return {"ok": True}
+
+    # ------------------------------------------------------------------
     # conversations
     # ------------------------------------------------------------------
 
     @app.get("/api/conversations")
-    async def list_conversations(_: None = Depends(require_auth)):
-        return {"conversations": db.list_conversations()}
+    async def list_conversations(
+        limit: int = Query(default=20, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+        _: None = Depends(require_auth),
+    ):
+        rows = db.list_conversations(limit=limit, offset=offset)
+        has_more = offset + len(rows) < db.conversation_count()
+        return {"conversations": rows, "has_more": has_more}
 
     @app.get("/api/search")
     async def search(
         q: str = "",
+        limit: int = Query(default=20, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
         _: None = Depends(require_auth),
     ):
-        return {"results": db.search(q[:100])}
+        results, has_more = db.search(q[:100], limit=limit, offset=offset)
+        return {"results": results, "has_more": has_more}
 
     @app.post("/api/conversations")
     async def create_conversation(
@@ -463,7 +595,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         model = normalize_model(payload.model)
         title = (payload.title or "").strip() or "新对话"
-        conversation = db.create_conversation(title, model)
+        prompt = get_prompt_or_400(payload.system_prompt_id)
+        conversation = db.create_conversation(
+            title,
+            model,
+            system_prompt_id=prompt["id"] if prompt else None,
+            system_prompt_name=str(prompt["name"]) if prompt else "",
+            system_prompt_text=str(prompt["content"]) if prompt else "",
+            single_turn=payload.single_turn,
+        )
         return {"conversation": conversation}
 
     @app.get("/api/conversations/{conversation_id}")
@@ -488,11 +628,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         conversation = db.get_conversation(conversation_id)
         if not conversation:
             raise HTTPException(status_code=404, detail="对话不存在")
+        if (
+            {"system_prompt_id", "single_turn"} & payload.model_fields_set
+            and db.message_count(conversation_id) > 0
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="对话开始后不能修改系统提示词或单轮模式",
+            )
         title = payload.title.strip() if payload.title is not None else None
         if title is not None and not title:
             raise HTTPException(status_code=400, detail="标题不能为空")
         model = normalize_model(payload.model) if payload.model is not None else None
-        updated = db.update_conversation(conversation_id, title=title or None, model=model)
+        updates: dict[str, Any] = {"title": title or None, "model": model}
+        if "system_prompt_id" in payload.model_fields_set:
+            prompt = get_prompt_or_400(payload.system_prompt_id)
+            updates["system_prompt_id"] = prompt["id"] if prompt else None
+            updates["system_prompt_name"] = str(prompt["name"]) if prompt else ""
+            updates["system_prompt_text"] = str(prompt["content"]) if prompt else ""
+        if "single_turn" in payload.model_fields_set and payload.single_turn is not None:
+            updates["single_turn"] = bool(payload.single_turn)
+        updated = db.update_conversation(conversation_id, **updates)
         return {"conversation": updated}
 
     @app.delete("/api/conversations/{conversation_id}")
@@ -826,9 +982,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload: ChatIn, request: Request, _: None = Depends(require_auth)
     ):
         content = payload.content.strip()
-        if not content:
-            raise HTTPException(status_code=400, detail="消息不能为空")
         attachment_ids = validate_attachment_ids(payload.attachment_ids)
+        if not content and not attachment_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="消息不能为空（引用不能单独发送）",
+            )
+        quoted_message_ids = list(dict.fromkeys(payload.quoted_message_ids))
+        prompt: dict[str, Any] | None = None
 
         parent_id: int | None = None
         has_files = bool(attachment_ids)
@@ -841,9 +1002,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             path = db.get_active_path(conversation["id"])
             parent_id = int(path[-1]["id"]) if path else None
             has_files = has_files or db.conversation_has_attachments(conversation["id"])
+            quotes = build_quotes(conversation["id"], quoted_message_ids)
+        else:
+            if quoted_message_ids:
+                raise HTTPException(status_code=400, detail="新对话没有可引用的历史消息")
+            quotes = []
+            prompt = get_prompt_or_400(payload.system_prompt_id)
         model = request_model(payload.model, payload.web_search, has_files)
         if payload.conversation_id is None:
-            conversation = db.create_conversation(make_title(content), model)
+            title_seed = content
+            if not title_seed and attachment_ids:
+                pending = db.get_pending_attachments(attachment_ids)
+                if pending:
+                    title_seed = str(pending[0]["filename"])
+            conversation = db.create_conversation(
+                make_title(title_seed),
+                model,
+                system_prompt_id=prompt["id"] if prompt else None,
+                system_prompt_name=str(prompt["name"]) if prompt else "",
+                system_prompt_text=str(prompt["content"]) if prompt else "",
+                single_turn=payload.single_turn,
+            )
 
         stop_event = register_stream(conversation["id"])
         try:
@@ -859,17 +1038,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 parent_id=parent_id,
                 status="complete",
                 model=model,
+                quotes=quotes,
             )
             linked = db.link_attachments(
                 attachment_ids, conversation["id"], int(user_message["id"])
             )
             user_message["attachments"] = linked
+            user_message["quotes"] = quotes
             conversation = db.update_conversation(conversation["id"], model=model) or conversation
-            context = db.get_context(
-                conversation["id"],
-                settings.max_context_chars,
-                leaf_id=int(user_message["id"]),
-            )
+            context = build_context(conversation, int(user_message["id"]))
             assistant_message = db.add_message(
                 conversation["id"],
                 "assistant",
@@ -927,6 +1104,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not content:
             raise HTTPException(status_code=400, detail="消息不能为空")
         attachment_ids = validate_attachment_ids(payload.attachment_ids)
+        quoted_message_ids = list(dict.fromkeys(payload.quoted_message_ids))
+        quotes = build_quotes(conversation_id, quoted_message_ids)
         has_files = bool(attachment_ids) or db.conversation_has_attachments(
             conversation_id
         )
@@ -944,6 +1123,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 content,
                 model,
                 title=make_title(content),
+                quotes_json=(
+                    json.dumps(quotes, ensure_ascii=False)
+                    if quoted_message_ids
+                    else None
+                ),
             )
             if not created:
                 raise HTTPException(status_code=404, detail="消息不存在")
@@ -955,11 +1139,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 attachment_ids, conversation_id, int(user_message["id"])
             )
             user_message["attachments"] = [*cloned, *linked]
-            context = db.get_context(
-                conversation_id,
-                settings.max_context_chars,
-                leaf_id=int(user_message["id"]),
-            )
+            user_message["quotes"] = parse_quotes(user_message.get("quotes_json", ""))
+            context = build_context(conversation, int(user_message["id"]))
             assistant_message = db.add_message(
                 conversation_id,
                 "assistant",
@@ -1030,11 +1211,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 db.conversation_has_attachments(conversation_id),
             )
             conversation = db.update_conversation(conversation_id, model=model) or conversation
-            context = db.get_context(
-                conversation_id,
-                settings.max_context_chars,
-                leaf_id=context_leaf,
-            )
+            context = build_context(conversation, context_leaf)
             assistant_message = db.add_message(
                 conversation_id,
                 "assistant",

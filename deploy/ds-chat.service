@@ -1,5 +1,6 @@
 [Unit]
 Description=DS Chat - single-user DeepSeek web chat
+Documentation=https://github.com/
 After=network-online.target
 Wants=network-online.target
 

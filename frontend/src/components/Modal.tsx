@@ -7,12 +7,14 @@ export function Modal({
   children,
   footer,
   onClose,
+  wide = false,
 }: {
   open: boolean;
   title: string;
   children: ReactNode;
   footer?: ReactNode;
   onClose: () => void;
+  wide?: boolean;
 }) {
   useEffect(() => {
     if (!open) return;
@@ -27,7 +29,12 @@ export function Modal({
 
   return (
     <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <div className="modal-card" role="dialog" aria-modal="true" aria-label={title}>
+      <div
+        className={`modal-card ${wide ? 'wide' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+      >
         <div className="modal-head">
           <h3>{title}</h3>
           <button type="button" className="icon-btn" onClick={onClose} aria-label="关闭">

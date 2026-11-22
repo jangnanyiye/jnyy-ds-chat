@@ -16,6 +16,7 @@ import {
   PanelLeft,
   PanelRightClose,
   Pencil,
+  Quote as QuoteIcon,
   RefreshCw,
   Send,
   Sparkles,
@@ -23,8 +24,9 @@ import {
   Wand2,
 } from 'lucide-react';
 import removeMarkdown from 'remove-markdown';
-import type { Attachment, Message, Model, Source } from '../types';
+import type { Attachment, Message, Model, Source, SystemPrompt } from '../types';
 import { formatBytes, formatTokens } from '../lib/format';
+import { ConversationSettings } from './ConversationSettings';
 import { Logo } from './Logo';
 import { ModelPicker } from './ModelPicker';
 
@@ -197,6 +199,27 @@ function MessageAttachments({ attachments }: { attachments?: Attachment[] }) {
   );
 }
 
+function quoteSnippet(text: string, limit = 72): string {
+  const value = text.replace(/\s+/g, ' ').trim();
+  return value.length > limit ? `${value.slice(0, limit)}…` : value;
+}
+
+function MessageQuotes({ quotes }: { quotes?: Message['quotes'] }) {
+  if (!quotes?.length) return null;
+  return (
+    <div className="message-quotes">
+      {quotes.map((quote, index) => (
+        <div className="message-quote" key={`${quote.id}-${index}`}>
+          <span className="message-quote-label">
+            {quote.role === 'user' ? '用户' : '回答'}
+          </span>
+          <span className="message-quote-text">{quoteSnippet(quote.content)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function MessageItem({
   message,
   isLast,
@@ -206,7 +229,11 @@ function MessageItem({
   onRegenerate,
   onEdit,
   onSwitchVersion,
+  onToggleQuote,
+  quoted,
   highlighted,
+  showIdentity,
+  showTokenUsage,
 }: {
   message: Message;
   isLast: boolean;
@@ -216,7 +243,11 @@ function MessageItem({
   onRegenerate: () => void;
   onEdit: (message: Message) => void;
   onSwitchVersion: (messageId: number) => void;
+  onToggleQuote: (message: Message) => void;
+  quoted: boolean;
   highlighted: boolean;
+  showIdentity: boolean;
+  showTokenUsage: boolean;
 }) {
   const [copied, setCopied] = useState<'raw' | 'plain' | null>(null);
   const isAssistant = message.role === 'assistant';
@@ -240,18 +271,29 @@ function MessageItem({
   if (!isAssistant) {
     return (
       <div
-        className={`message user ${highlighted ? 'highlight' : ''}`}
+        className={`message user ${highlighted ? 'highlight' : ''} ${quoted ? 'quoted' : ''}`}
         data-message-id={message.id}
       >
         <div className="user-content">
+          <MessageQuotes quotes={message.quotes} />
           <MessageAttachments attachments={message.attachments} />
-          <div className="user-bubble">{message.content}</div>
+          {message.content && <div className="user-bubble">{message.content}</div>}
           <BranchSwitcher message={message} disabled={streaming} onSwitch={onSwitchVersion} />
           {!streaming && (
             <div className="message-actions user-actions">
               <button type="button" onClick={copy} aria-label="复制用户消息">
                 {copied === 'raw' ? <Check size={14} /> : <Copy size={14} />}
                 <span>{copied === 'raw' ? '已复制' : '复制'}</span>
+              </button>
+              <button
+                type="button"
+                className={quoted ? 'quote-action active' : 'quote-action'}
+                onClick={() => onToggleQuote(message)}
+                aria-label={quoted ? '取消引用这条消息' : '引用这条消息'}
+                aria-pressed={quoted}
+              >
+                <QuoteIcon size={14} />
+                <span>{quoted ? '已引用' : '引用'}</span>
               </button>
               <button type="button" onClick={() => onEdit(message)} aria-label="编辑用户消息">
                 <Pencil size={14} />
@@ -272,28 +314,32 @@ function MessageItem({
 
   return (
     <div
-      className={`message assistant ${highlighted ? 'highlight' : ''}`}
+      className={`message assistant ${highlighted ? 'highlight' : ''} ${quoted ? 'quoted' : ''}`}
       data-message-id={message.id}
     >
-      <div className="assistant-avatar">
-        <Logo size={26} />
-      </div>
-      <div className="assistant-body">
-        <div className="assistant-name">
-          <span>DeepSeek</span>
-          {message.web_search && (
-            <span className="web-badge">
-              <Globe size={10} />
-              联网
-            </span>
-          )}
-          {message.thinking && (
-            <span className="web-badge thinking-badge">
-              <Brain size={10} />
-              思考
-            </span>
-          )}
+      {showIdentity && (
+        <div className="assistant-head">
+          <div className="assistant-avatar">
+            <Logo size={26} />
+          </div>
+          <div className="assistant-name">
+            <span>DeepSeek</span>
+            {message.web_search && (
+              <span className="web-badge">
+                <Globe size={10} />
+                联网
+              </span>
+            )}
+            {message.thinking && (
+              <span className="web-badge thinking-badge">
+                <Brain size={10} />
+                思考
+              </span>
+            )}
+          </div>
         </div>
+      )}
+      <div className="assistant-body">
         {message.searching && message.status === 'streaming' && (
           <div className="searching-chip">
             <Loader2 size={13} className="spin" />
@@ -339,6 +385,16 @@ function MessageItem({
               {copied === 'plain' ? <Check size={14} /> : <FileText size={14} />}
               <span>{copied === 'plain' ? '已复制' : '纯文本'}</span>
             </button>
+            <button
+              type="button"
+              className={quoted ? 'quote-action active' : 'quote-action'}
+              onClick={() => onToggleQuote(message)}
+              aria-label={quoted ? '取消引用这条回答' : '引用这条回答'}
+              aria-pressed={quoted}
+            >
+              <QuoteIcon size={14} />
+              <span>{quoted ? '已引用' : '引用'}</span>
+            </button>
             {isLast && canRegenerate && !streaming && (
               <button type="button" onClick={onRegenerate} aria-label="重新生成">
                 <RefreshCw size={14} />
@@ -348,7 +404,7 @@ function MessageItem({
           </div>
         )}
 
-        {hasUsage && (
+        {showTokenUsage && hasUsage && (
           <div className="token-usage" title={`本轮共 ${totalTokens} tokens`}>
             <span>本轮</span>
             {message.prompt_tokens != null && <span>输入 {formatTokens(message.prompt_tokens)}</span>}
@@ -379,6 +435,16 @@ export function ChatView({
   messages,
   model,
   streaming,
+  systemPromptId,
+  systemPromptName,
+  systemPromptText,
+  singleTurn,
+  prompts,
+  quotedMessageIds,
+  showTokenUsage,
+  showAssistantIdentity,
+  showChatTitle,
+  showSystemPromptMessage,
   onOpenSidebar,
   onModelChange,
   onRegenerate,
@@ -386,6 +452,10 @@ export function ChatView({
   onSuggestion,
   onEdit,
   onSwitchVersion,
+  onToggleQuote,
+  onSelectPrompt,
+  onToggleSingleTurn,
+  onManagePrompts,
   highlightMessageId,
 }: {
   conversationId: number;
@@ -393,6 +463,16 @@ export function ChatView({
   messages: Message[];
   model: Model;
   streaming: boolean;
+  systemPromptId: number | null;
+  systemPromptName: string;
+  systemPromptText: string;
+  singleTurn: boolean;
+  prompts: SystemPrompt[];
+  quotedMessageIds: number[];
+  showTokenUsage: boolean;
+  showAssistantIdentity: boolean;
+  showChatTitle: boolean;
+  showSystemPromptMessage: boolean;
   onOpenSidebar: () => void;
   onModelChange: (model: Model) => void;
   onRegenerate: () => void;
@@ -400,6 +480,10 @@ export function ChatView({
   onSuggestion: (text: string) => void;
   onEdit: (message: Message) => void;
   onSwitchVersion: (messageId: number) => void;
+  onToggleQuote: (message: Message) => void;
+  onSelectPrompt: (promptId: number | null) => void;
+  onToggleSingleTurn: (enabled: boolean) => void;
+  onManagePrompts: () => void;
   highlightMessageId: number | null;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -519,12 +603,26 @@ export function ChatView({
           <PanelLeft size={20} />
         </button>
         <div className="chat-title">
-          <h1>{title}</h1>
+          <div className="chat-title-row">
+            {showChatTitle && <h1>{title}</h1>}
+            {singleTurn && <span className="single-turn-badge">单轮</span>}
+          </div>
           <span title={`输入 ${totalPrompt} tokens · 输出 ${totalCompletion} tokens`}>
             本对话共 {formatTokens(totalTokens)} tokens
             {streaming ? ' · 正在生成…' : ''}
           </span>
         </div>
+        <ConversationSettings
+          systemPromptId={systemPromptId}
+          singleTurn={singleTurn}
+          prompts={prompts}
+          systemPromptName={systemPromptName}
+          disabled={streaming}
+          locked={messages.length > 0}
+          onSelectPrompt={onSelectPrompt}
+          onToggleSingleTurn={onToggleSingleTurn}
+          onManagePrompts={onManagePrompts}
+        />
         <ModelPicker model={model} disabled={streaming} onChange={onModelChange} />
       </header>
 
@@ -556,6 +654,15 @@ export function ChatView({
           </div>
         ) : (
           <div className="message-list">
+            {showSystemPromptMessage && systemPromptText && (
+              <div className="system-prompt-message">
+                <div className="system-prompt-message-head">
+                  <FileText size={13} />
+                  <span>系统提示词{systemPromptName ? ` · ${systemPromptName}` : ''}</span>
+                </div>
+                <p>{systemPromptText}</p>
+              </div>
+            )}
             {messages.map((message, index) => (
               <MessageItem
                 key={message.id}
@@ -567,7 +674,11 @@ export function ChatView({
                 onRegenerate={onRegenerate}
                 onEdit={onEdit}
                 onSwitchVersion={onSwitchVersion}
+                onToggleQuote={onToggleQuote}
+                quoted={quotedMessageIds.includes(message.id)}
                 highlighted={activeHighlight === message.id}
+                showIdentity={showAssistantIdentity}
+                showTokenUsage={showTokenUsage}
               />
             ))}
             <div className="message-list-tail" />

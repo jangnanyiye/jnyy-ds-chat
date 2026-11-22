@@ -1,14 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Loader2,
   LogOut,
   MessageSquare,
-  Moon,
   MoreHorizontal,
   PanelLeftClose,
   Pencil,
   Plus,
   Search,
-  Sun,
+  Settings,
   Trash2,
 } from 'lucide-react';
 import type { Conversation } from '../types';
@@ -19,27 +19,31 @@ export function Sidebar({
   conversations,
   activeId,
   open,
-  theme,
+  hasMore,
+  loadingMore,
   onClose,
   onNew,
   onSearch,
+  onLoadMore,
   onSelect,
   onRename,
   onDelete,
-  onToggleTheme,
+  onSettings,
   onLogout,
 }: {
   conversations: Conversation[];
   activeId: number | null;
   open: boolean;
-  theme: 'light' | 'dark';
+  hasMore: boolean;
+  loadingMore: boolean;
   onClose: () => void;
   onNew: () => void;
   onSearch: () => void;
+  onLoadMore: () => void;
   onSelect: (id: number) => void;
   onRename: (conversation: Conversation) => void;
   onDelete: (conversation: Conversation) => void;
-  onToggleTheme: () => void;
+  onSettings: () => void;
   onLogout: () => void;
 }) {
   const [menuId, setMenuId] = useState<number | null>(null);
@@ -164,22 +168,27 @@ export function Sidebar({
             </section>
           ))
         )}
+        {hasMore && (
+          <button
+            type="button"
+            className="load-more-conversations"
+            onClick={onLoadMore}
+            disabled={loadingMore}
+          >
+            {loadingMore ? <Loader2 size={14} className="spin" /> : <Plus size={14} />}
+            {loadingMore ? '加载中…' : '加载更多'}
+          </button>
+        )}
       </div>
 
-      <div className="sidebar-foot">
-        <div className="account-row">
-          <div className="account-avatar">D</div>
-          <div className="account-info">
-            <strong>本地用户</strong>
-            <span>单用户模式</span>
-          </div>
-          <button type="button" className="icon-btn" onClick={onLogout} aria-label="退出登录" title="退出登录">
-            <LogOut size={17} />
-          </button>
-        </div>
-        <button type="button" className="side-action" onClick={onToggleTheme}>
-          {theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}
-          <span>{theme === 'light' ? '深色模式' : '浅色模式'}</span>
+      <div className="sidebar-foot sidebar-actions">
+        <button type="button" className="side-action" onClick={onSettings}>
+          <Settings size={16} />
+          <span>设置</span>
+        </button>
+        <button type="button" className="side-action" onClick={onLogout}>
+          <LogOut size={16} />
+          <span>退出登录</span>
         </button>
       </div>
     </aside>

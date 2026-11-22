@@ -62,7 +62,6 @@ export function ModelPicker({
                 </span>
                 <span className="model-option-copy">
                   <strong>{item.name}</strong>
-                  <small>{item.description}</small>
                 </span>
                 {item.id === model && <Check size={16} />}
               </button>

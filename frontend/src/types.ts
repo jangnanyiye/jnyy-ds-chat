@@ -28,6 +28,20 @@ export interface Attachment {
   url: string;
 }
 
+export interface SystemPrompt {
+  id: number;
+  name: string;
+  content: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface Quote {
+  id: number;
+  role: 'user' | 'assistant';
+  content: string;
+}
+
 export interface Source {
   type?: string;
   url: string;
@@ -45,6 +59,10 @@ export interface Conversation {
   title: string;
   model: Model;
   active_leaf_id?: number | null;
+  system_prompt_id?: number | null;
+  system_prompt_name?: string;
+  system_prompt_text?: string;
+  single_turn?: boolean;
   created_at: number;
   updated_at: number;
   preview?: string | null;
@@ -70,6 +88,7 @@ export interface Message {
   sources?: Source[];
   annotations?: unknown[];
   attachments?: Attachment[];
+  quotes?: Quote[];
   prompt_tokens?: number | null;
   completion_tokens?: number | null;
   reasoning_tokens?: number | null;

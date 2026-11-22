@@ -10,10 +10,22 @@ from pathlib import Path
 from typing import Any, Iterator
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS system_prompts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS conversations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
     model TEXT NOT NULL,
+    system_prompt_id INTEGER,
+    system_prompt_name TEXT NOT NULL DEFAULT '',
+    system_prompt_text TEXT NOT NULL DEFAULT '',
+    single_turn INTEGER NOT NULL DEFAULT 0,
     active_leaf_id INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -38,6 +50,7 @@ CREATE TABLE IF NOT EXISTS messages (
     cached_tokens INTEGER,
     sources_json TEXT NOT NULL DEFAULT '',
     annotations_json TEXT NOT NULL DEFAULT '',
+    quotes_json TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -77,13 +90,63 @@ MESSAGE_COLUMNS = {
     "cached_tokens",
     "sources_json",
     "annotations_json",
+    "quotes_json",
 }
 
 VALID_STATUSES = {"complete", "streaming", "stopped", "error", "interrupted"}
+_UNSET = object()
+
+
+def parse_quotes(raw: str | None) -> list[dict[str, Any]]:
+    try:
+        values = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(values, list):
+        return []
+    quotes: list[dict[str, Any]] = []
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        role = value.get("role")
+        content = value.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            continue
+        try:
+            message_id = int(value.get("id"))
+        except (TypeError, ValueError):
+            continue
+        quotes.append(
+            {"id": message_id, "role": role, "content": content}
+        )
+    return quotes[:8]
+
+
+def quote_prefix(quotes: list[dict[str, Any]]) -> str:
+    if not quotes:
+        return ""
+    lines = ["以下是用户手动引用的历史上下文，仅用于辅助回答本轮问题：", ""]
+    for index, quote in enumerate(quotes, start=1):
+        label = "用户" if quote["role"] == "user" else "助手"
+        lines.append(f"[引用 {index} · {label}]")
+        lines.append(str(quote["content"]).strip())
+        lines.append("")
+    lines.append("[当前问题]")
+    return "\n".join(lines)
 
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def public_conversation(
+    row: dict[str, Any], *, include_prompt_text: bool = True
+) -> dict[str, Any]:
+    conversation = dict(row)
+    conversation["single_turn"] = bool(conversation.get("single_turn"))
+    if not include_prompt_text:
+        conversation.pop("system_prompt_text", None)
+    return conversation
 
 
 def public_attachment(row: dict[str, Any]) -> dict[str, Any]:
@@ -155,6 +218,10 @@ class Database:
             conn.execute(
                 "ALTER TABLE messages ADD COLUMN annotations_json TEXT NOT NULL DEFAULT ''"
             )
+        if "quotes_json" not in columns:
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN quotes_json TEXT NOT NULL DEFAULT ''"
+            )
 
         # 旧模型收敛到新模型：chat -> V4-Pro，reasoner 另外保留“深度思考”标记。
         conn.execute(
@@ -172,6 +239,37 @@ class Database:
         }
         if "active_leaf_id" not in conversation_columns:
             conn.execute("ALTER TABLE conversations ADD COLUMN active_leaf_id INTEGER")
+        if "system_prompt_id" not in conversation_columns:
+            conn.execute("ALTER TABLE conversations ADD COLUMN system_prompt_id INTEGER")
+        if "system_prompt_name" not in conversation_columns:
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN system_prompt_name TEXT NOT NULL DEFAULT ''"
+            )
+        if "system_prompt_text" not in conversation_columns:
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN system_prompt_text TEXT NOT NULL DEFAULT ''"
+            )
+        if "single_turn" not in conversation_columns:
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN single_turn INTEGER NOT NULL DEFAULT 0"
+            )
+
+        # 旧数据把提示词快照补齐；之后提示词库修改/删除不再影响已有对话。
+        conn.execute(
+            """
+            UPDATE conversations
+            SET system_prompt_name = COALESCE(
+                    (SELECT name FROM system_prompts WHERE id = conversations.system_prompt_id),
+                    system_prompt_name
+                ),
+                system_prompt_text = COALESCE(
+                    (SELECT content FROM system_prompts WHERE id = conversations.system_prompt_id),
+                    system_prompt_text
+                )
+            WHERE system_prompt_id IS NOT NULL
+              AND (system_prompt_name = '' OR system_prompt_text = '')
+            """
+        )
 
         # 旧数据库是线性消息：按 id 顺序补 parent_id，并把最后一条设为活动叶子。
         if added_parent:
@@ -206,15 +304,116 @@ class Database:
         return True
 
     # ------------------------------------------------------------------
-    # conversations
+    # system prompts
     # ------------------------------------------------------------------
 
-    def create_conversation(self, title: str, model: str) -> dict[str, Any]:
+    def list_prompts(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM system_prompts ORDER BY updated_at DESC, id DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_prompt(self, prompt_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM system_prompts WHERE id = ?", (prompt_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def create_prompt(self, name: str, content: str) -> dict[str, Any]:
         ts = now_ms()
         with self.connect() as conn:
             cur = conn.execute(
-                "INSERT INTO conversations (title, model, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                (title or "新对话", model, ts, ts),
+                "INSERT INTO system_prompts (name, content, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (name, content, ts, ts),
+            )
+            prompt_id = int(cur.lastrowid)
+        prompt = self.get_prompt(prompt_id)
+        assert prompt is not None
+        return prompt
+
+    def update_prompt(
+        self, prompt_id: int, *, name: str | None = None, content: str | None = None
+    ) -> dict[str, Any] | None:
+        fields: list[str] = []
+        values: list[Any] = []
+        if name is not None:
+            fields.append("name = ?")
+            values.append(name)
+        if content is not None:
+            fields.append("content = ?")
+            values.append(content)
+        if not fields:
+            return self.get_prompt(prompt_id)
+        fields.append("updated_at = ?")
+        values.append(now_ms())
+        values.append(prompt_id)
+        with self.connect() as conn:
+            cur = conn.execute(
+                f"UPDATE system_prompts SET {', '.join(fields)} WHERE id = ?", values
+            )
+            if cur.rowcount == 0:
+                return None
+        return self.get_prompt(prompt_id)
+
+    def delete_prompt(self, prompt_id: int) -> bool:
+        with self.connect() as conn:
+            # 空对话还没有上下文，直接清掉快照；已开始对话保留快照，避免前后割裂。
+            conn.execute(
+                """
+                UPDATE conversations
+                SET system_prompt_id = NULL,
+                    system_prompt_name = '',
+                    system_prompt_text = ''
+                WHERE system_prompt_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM messages m WHERE m.conversation_id = conversations.id
+                  )
+                """,
+                (prompt_id,),
+            )
+            conn.execute(
+                "UPDATE conversations SET system_prompt_id = NULL WHERE system_prompt_id = ?",
+                (prompt_id,),
+            )
+            cur = conn.execute(
+                "DELETE FROM system_prompts WHERE id = ?", (prompt_id,)
+            )
+            return cur.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # conversations
+    # ------------------------------------------------------------------
+
+    def create_conversation(
+        self,
+        title: str,
+        model: str,
+        *,
+        system_prompt_id: int | None = None,
+        system_prompt_name: str = "",
+        system_prompt_text: str = "",
+        single_turn: bool = False,
+    ) -> dict[str, Any]:
+        ts = now_ms()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO conversations
+                    (title, model, system_prompt_id, system_prompt_name, system_prompt_text, single_turn, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    title or "新对话",
+                    model,
+                    system_prompt_id,
+                    system_prompt_name,
+                    system_prompt_text,
+                    1 if single_turn else 0,
+                    ts,
+                    ts,
+                ),
             )
             conv_id = int(cur.lastrowid)
         conversation = self.get_conversation(conv_id)
@@ -226,9 +425,11 @@ class Database:
             row = conn.execute(
                 "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
             ).fetchone()
-        return dict(row) if row else None
+        return public_conversation(row) if row else None
 
-    def list_conversations(self, limit: int = 200) -> list[dict[str, Any]]:
+    def list_conversations(
+        self, limit: int = 200, offset: int = 0
+    ) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
                 """
@@ -254,11 +455,16 @@ class Database:
                        ) AS message_count
                 FROM conversations c
                 ORDER BY c.updated_at DESC, c.id DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (limit,),
+                (limit, offset),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [public_conversation(row, include_prompt_text=False) for row in rows]
+
+    def conversation_count(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute("SELECT count(*) AS count FROM conversations").fetchone()
+        return int(row["count"]) if row else 0
 
     def update_conversation(
         self,
@@ -266,6 +472,10 @@ class Database:
         *,
         title: str | None = None,
         model: str | None = None,
+        system_prompt_id: int | None | object = _UNSET,
+        system_prompt_name: str | None | object = _UNSET,
+        system_prompt_text: str | None | object = _UNSET,
+        single_turn: bool | None = None,
     ) -> dict[str, Any] | None:
         fields: list[str] = []
         values: list[Any] = []
@@ -275,6 +485,18 @@ class Database:
         if model is not None:
             fields.append("model = ?")
             values.append(model)
+        if system_prompt_id is not _UNSET:
+            fields.append("system_prompt_id = ?")
+            values.append(system_prompt_id)
+        if system_prompt_name is not _UNSET:
+            fields.append("system_prompt_name = ?")
+            values.append(system_prompt_name)
+        if system_prompt_text is not _UNSET:
+            fields.append("system_prompt_text = ?")
+            values.append(system_prompt_text)
+        if single_turn is not None:
+            fields.append("single_turn = ?")
+            values.append(1 if single_turn else 0)
         if not fields:
             return self.get_conversation(conversation_id)
         fields.append("updated_at = ?")
@@ -315,6 +537,7 @@ class Database:
         model: str | None = None,
         web_search: bool = False,
         thinking: bool = False,
+        quotes: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         if role not in {"user", "assistant"}:
             raise ValueError(f"invalid role: {role}")
@@ -325,8 +548,8 @@ class Database:
             cur = conn.execute(
                 """
                 INSERT INTO messages
-                    (conversation_id, parent_id, role, content, reasoning, status, error, model, web_search, thinking, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (conversation_id, parent_id, role, content, reasoning, status, error, model, web_search, thinking, quotes_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     conversation_id,
@@ -339,6 +562,7 @@ class Database:
                     model,
                     1 if web_search else 0,
                     1 if thinking else 0,
+                    json.dumps(quotes or [], ensure_ascii=False) if quotes else "",
                     ts,
                     ts,
                 ),
@@ -356,6 +580,20 @@ class Database:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
         return dict(row) if row else None
+
+    def get_messages_by_ids(
+        self, conversation_id: int, message_ids: list[int]
+    ) -> dict[int, dict[str, Any]]:
+        unique_ids = list(dict.fromkeys(message_ids))
+        if not unique_ids:
+            return {}
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM messages WHERE conversation_id = ? AND id IN ({placeholders})",
+                [conversation_id, *unique_ids],
+            ).fetchall()
+        return {int(row["id"]): dict(row) for row in rows}
 
     def list_messages(
         self,
@@ -482,6 +720,7 @@ class Database:
                         message[key] = json.loads(raw) if raw else []
                     except (TypeError, ValueError):
                         message[key] = []
+                message["quotes"] = parse_quotes(message.pop("quotes_json", ""))
         return messages
 
     def latest_leaf(self, conversation_id: int, message_id: int) -> int | None:
@@ -547,6 +786,7 @@ class Database:
         model: str,
         *,
         title: str | None = None,
+        quotes_json: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]] | None:
         """编辑用户消息时创建一个同父的新版本，旧分支完整保留。"""
         ts = now_ms()
@@ -562,10 +802,18 @@ class Database:
             cur = conn.execute(
                 """
                 INSERT INTO messages
-                    (conversation_id, parent_id, role, content, reasoning, status, error, model, created_at, updated_at)
-                VALUES (?, ?, 'user', ?, '', 'complete', '', ?, ?, ?)
+                    (conversation_id, parent_id, role, content, reasoning, status, error, model, quotes_json, created_at, updated_at)
+                VALUES (?, ?, 'user', ?, '', 'complete', '', ?, ?, ?, ?)
                 """,
-                (conversation_id, parent_id, content, model, ts, ts),
+                (
+                    conversation_id,
+                    parent_id,
+                    content,
+                    model,
+                    source["quotes_json"] if quotes_json is None else quotes_json,
+                    ts,
+                    ts,
+                ),
             )
             new_message_id = int(cur.lastrowid)
 
@@ -762,11 +1010,13 @@ class Database:
             ).fetchone()
         return int(row["n"]) if row else 0
 
-    def search(self, query: str, limit: int = 40) -> list[dict[str, Any]]:
+    def search(
+        self, query: str, limit: int = 40, offset: int = 0
+    ) -> tuple[list[dict[str, Any]], bool]:
         """搜索所有分支；点击结果时由前端激活命中的分支。"""
         needle = query.strip().lower()
         if not needle:
-            return []
+            return [], False
 
         def snippet(text: str, radius: int = 48) -> str:
             compact = re.sub(r"\s+", " ", text or "").strip()
@@ -818,10 +1068,11 @@ class Database:
                         }
                     )
 
-                if len(results) >= limit:
+                if len(results) >= offset + limit + 1:
                     break
 
-        return results[:limit]
+        has_more = len(results) > offset + limit
+        return results[offset : offset + limit], has_more
 
     def has_streaming_message(self, conversation_id: int) -> bool:
         with self.connect() as conn:
@@ -850,8 +1101,18 @@ class Database:
         max_chars: int = 60_000,
         *,
         leaf_id: int | None = None,
+        single_turn: bool = False,
     ) -> list[dict[str, Any]]:
-        path = self.get_active_path(conversation_id, leaf_id=leaf_id)
+        full_path = self.get_active_path(conversation_id, leaf_id=leaf_id)
+        last_user_id = next(
+            (
+                int(message["id"])
+                for message in reversed(full_path)
+                if message["role"] == "user"
+            ),
+            None,
+        )
+        path = full_path[-1:] if single_turn and full_path else full_path
         message_ids = [int(message["id"]) for message in path]
         files_by_message: dict[int, list[str]] = {}
         if message_ids:
@@ -888,6 +1149,11 @@ class Database:
         total = 0
         for row in reversed(rows):
             text = str(row["content"])
+            if int(row["id"]) == last_user_id:
+                quotes = parse_quotes(row.get("quotes_json", ""))
+                if quotes:
+                    prefix = quote_prefix(quotes)
+                    text = f"{prefix}\n\n{text}" if text else prefix
             file_ids = files_by_message.get(int(row["id"])) or []
             if file_ids:
                 content: Any = []

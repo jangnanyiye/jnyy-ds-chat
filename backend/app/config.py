@@ -47,7 +47,8 @@ class Settings:
     allowed_models: tuple[str, ...] = DEFAULT_MODELS
     max_context_chars: int = 60_000
     max_output_tokens: int = 8_192
-    upstream_timeout: float = 300.0
+    # 深度思考可能长时间无首 token；给足上游时间，避免中途被判超时。
+    upstream_timeout: float = 1800.0
     debug: bool = False
     extra: dict = field(default_factory=dict, repr=False)
 

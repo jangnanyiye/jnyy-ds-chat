@@ -9,6 +9,7 @@ import type {
   Model,
   SearchResult,
   Source,
+  SystemPrompt,
 } from '../types';
 
 export class ApiError extends Error {
@@ -79,12 +80,21 @@ export async function logout(): Promise<{ ok: boolean }> {
   return request('/api/auth/logout', { method: 'POST' }, { auth: false });
 }
 
-export async function listConversations(): Promise<{ conversations: Conversation[] }> {
-  return request('/api/conversations');
+export async function listConversations(
+  limit = 20,
+  offset = 0,
+): Promise<{ conversations: Conversation[]; has_more: boolean }> {
+  return request(`/api/conversations?limit=${limit}&offset=${offset}`);
 }
 
-export async function searchGlobal(query: string): Promise<{ results: SearchResult[] }> {
-  return request(`/api/search?q=${encodeURIComponent(query)}`);
+export async function searchGlobal(
+  query: string,
+  limit = 20,
+  offset = 0,
+): Promise<{ results: SearchResult[]; has_more: boolean }> {
+  return request(
+    `/api/search?q=${encodeURIComponent(query)}&limit=${limit}&offset=${offset}`,
+  );
 }
 
 export async function uploadAttachment(file: File): Promise<{ attachment: Attachment }> {
@@ -148,6 +158,44 @@ export async function setConversationModel(
     method: 'PATCH',
     body: JSON.stringify({ model }),
   });
+}
+
+export async function setConversationSettings(
+  id: number,
+  settings: { system_prompt_id?: number | null; single_turn?: boolean },
+): Promise<{ conversation: Conversation }> {
+  return request(`/api/conversations/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(settings),
+  });
+}
+
+export async function listPrompts(): Promise<{ prompts: SystemPrompt[] }> {
+  return request('/api/prompts');
+}
+
+export async function createPrompt(
+  name: string,
+  content: string,
+): Promise<{ prompt: SystemPrompt }> {
+  return request('/api/prompts', {
+    method: 'POST',
+    body: JSON.stringify({ name, content }),
+  });
+}
+
+export async function updatePrompt(
+  id: number,
+  values: { name?: string; content?: string },
+): Promise<{ prompt: SystemPrompt }> {
+  return request(`/api/prompts/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(values),
+  });
+}
+
+export async function deletePrompt(id: number): Promise<{ ok: boolean }> {
+  return request(`/api/prompts/${id}`, { method: 'DELETE' });
 }
 
 export async function deleteConversation(id: number): Promise<{ ok: boolean }> {
@@ -286,6 +334,9 @@ export async function streamChat(
   webSearch: boolean,
   thinking: boolean,
   attachmentIds: string[],
+  systemPromptId: number | null,
+  singleTurn: boolean,
+  quotedMessageIds: number[],
   handlers: StreamHandlers,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -298,6 +349,9 @@ export async function streamChat(
       web_search: webSearch,
       thinking,
       attachment_ids: attachmentIds,
+      system_prompt_id: systemPromptId,
+      single_turn: singleTurn,
+      quoted_message_ids: quotedMessageIds,
     },
     handlers,
     signal,
@@ -328,6 +382,7 @@ export async function editMessage(
   webSearch: boolean,
   thinking: boolean,
   attachmentIds: string[],
+  quotedMessageIds: number[],
   handlers: StreamHandlers,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -339,6 +394,7 @@ export async function editMessage(
       web_search: webSearch,
       thinking,
       attachment_ids: attachmentIds,
+      quoted_message_ids: quotedMessageIds,
     },
     handlers,
     signal,

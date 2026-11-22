@@ -6,16 +6,20 @@ import type { SearchResult } from '../types';
 
 export function SearchDialog({
   open,
+  step,
   onClose,
   onSelect,
 }: {
   open: boolean;
+  step: number;
   onClose: () => void;
   onSelect: (result: SearchResult) => void;
 }) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResult[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -24,6 +28,8 @@ export function SearchDialog({
       setQuery('');
       setResults([]);
       setLoading(false);
+      setLoadingMore(false);
+      setHasMore(false);
       setSelectedIndex(0);
       return;
     }
@@ -36,6 +42,7 @@ export function SearchDialog({
     if (!keyword) {
       setResults([]);
       setLoading(false);
+      setHasMore(false);
       return;
     }
 
@@ -43,12 +50,16 @@ export function SearchDialog({
     setLoading(true);
     const timer = window.setTimeout(async () => {
       try {
-        const data = await searchGlobal(keyword);
+        const data = await searchGlobal(keyword, step, 0);
         if (cancelled) return;
         setResults(data.results);
+        setHasMore(data.has_more);
         setSelectedIndex(0);
       } catch {
-        if (!cancelled) setResults([]);
+        if (!cancelled) {
+          setResults([]);
+          setHasMore(false);
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -58,7 +69,36 @@ export function SearchDialog({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [open, query]);
+  }, [open, query, step]);
+
+  const loadMore = async () => {
+    if (loadingMore || !hasMore) return;
+    const keyword = query.trim();
+    if (!keyword) return;
+    setLoadingMore(true);
+    try {
+      const data = await searchGlobal(keyword, step, results.length);
+      setResults((current) => {
+        const known = new Set(
+          current.map(
+            (result) => `${result.conversation_id}-${result.message_id ?? 'title'}`,
+          ),
+        );
+        return [
+          ...current,
+          ...data.results.filter(
+            (result) =>
+              !known.has(`${result.conversation_id}-${result.message_id ?? 'title'}`),
+          ),
+        ];
+      });
+      setHasMore(data.has_more);
+    } catch {
+      // 保留已加载结果
+    } finally {
+      setLoadingMore(false);
+    }
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -129,35 +169,48 @@ export function SearchDialog({
               <span>换个关键词试试</span>
             </div>
           ) : (
-            results.map((result, index) => (
-              <button
-                key={`${result.conversation_id}-${result.message_id ?? 'title'}-${index}`}
-                type="button"
-                className={`search-result ${index === selectedIndex ? 'active' : ''}`}
-                onMouseEnter={() => setSelectedIndex(index)}
-                onClick={() => choose(result)}
-              >
-                <span className={`search-result-icon ${result.role || 'title'}`}>
-                  {result.role === 'user' ? (
-                    <User size={15} />
-                  ) : result.role === 'assistant' ? (
-                    <MessageSquare size={15} />
-                  ) : (
-                    <Search size={15} />
-                  )}
-                </span>
-                <span className="search-result-body">
-                  <span className="search-result-head">
-                    <strong>{result.conversation_title}</strong>
-                    <small>{formatRelative(result.updated_at)}</small>
+            <>
+              {results.map((result, index) => (
+                <button
+                  key={`${result.conversation_id}-${result.message_id ?? 'title'}-${index}`}
+                  type="button"
+                  className={`search-result ${index === selectedIndex ? 'active' : ''}`}
+                  onMouseEnter={() => setSelectedIndex(index)}
+                  onClick={() => choose(result)}
+                >
+                  <span className={`search-result-icon ${result.role || 'title'}`}>
+                    {result.role === 'user' ? (
+                      <User size={15} />
+                    ) : result.role === 'assistant' ? (
+                      <MessageSquare size={15} />
+                    ) : (
+                      <Search size={15} />
+                    )}
                   </span>
-                  <span className="search-result-snippet">{result.snippet}</span>
-                </span>
-                <span className="search-result-role">
-                  {result.role === 'user' ? '你' : result.role === 'assistant' ? 'DeepSeek' : '标题'}
-                </span>
-              </button>
-            ))
+                  <span className="search-result-body">
+                    <span className="search-result-head">
+                      <strong>{result.conversation_title}</strong>
+                      <small>{formatRelative(result.updated_at)}</small>
+                    </span>
+                    <span className="search-result-snippet">{result.snippet}</span>
+                  </span>
+                  <span className="search-result-role">
+                    {result.role === 'user' ? '你' : result.role === 'assistant' ? 'DeepSeek' : '标题'}
+                  </span>
+                </button>
+              ))}
+              {hasMore && (
+                <button
+                  type="button"
+                  className="search-more"
+                  onClick={() => void loadMore()}
+                  disabled={loadingMore}
+                >
+                  {loadingMore && <Loader2 size={14} className="spin" />}
+                  {loadingMore ? '加载中…' : '加载更多结果'}
+                </button>
+              )}
+            </>
           )}
         </div>
 

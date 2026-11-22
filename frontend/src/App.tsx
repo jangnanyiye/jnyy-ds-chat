@@ -17,16 +17,28 @@ import {
   getConversation,
   getSession,
   listConversations,
+  listPrompts,
   login,
   logout,
   regenerate as regenerateRequest,
   renameConversation,
   setConversationModel,
+  setConversationSettings,
   stopConversation,
   streamChat,
   uploadAttachment,
   type StreamHandlers,
 } from './lib/api';
+import { PromptLibrary } from './components/PromptLibrary';
+import { SettingsDialog } from './components/SettingsDialog';
+import {
+  initialTheme,
+  isDarkLocked,
+  loadPreferences,
+  savePreferences,
+  setDarkLocked,
+  type Preferences,
+} from './lib/prefs';
 import {
   normalizeModel,
   type Attachment,
@@ -34,24 +46,18 @@ import {
   type Message,
   type Model,
   type SearchResult,
+  type SystemPrompt,
 } from './types';
 
 type AuthState = 'loading' | 'out' | 'in';
 type Theme = 'light' | 'dark';
 
 const LAST_KEY = 'dschat.last';
-const THEME_KEY = 'dschat.theme';
 const SIDEBAR_KEY = 'dschat.sidebar';
 const WEB_SEARCH_KEY = 'dschat.websearch';
 const THINKING_KEY = 'dschat.thinking';
 const MAX_ATTACHMENTS = 6;
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
-
-function getInitialTheme(): Theme {
-  const saved = localStorage.getItem(THEME_KEY);
-  if (saved === 'light' || saved === 'dark') return saved;
-  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-}
 
 function upsertConversation(list: Conversation[], conversation: Conversation): Conversation[] {
   const existing = list.find((item) => item.id === conversation.id);
@@ -118,6 +124,8 @@ function makeTempMessage(conversationId: number, role: 'user' | 'assistant', con
 export default function App() {
   const [auth, setAuth] = useState<AuthState>('loading');
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [hasMoreConversations, setHasMoreConversations] = useState(false);
+  const [loadingMoreConversations, setLoadingMoreConversations] = useState(false);
   const [activeId, setActiveId] = useState<number | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [model, setModel] = useState<Model>('deepseek-v4-pro');
@@ -139,7 +147,17 @@ export default function App() {
   );
   const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
   const [uploadingFiles, setUploadingFiles] = useState<{ id: string; name: string }[]>([]);
-  const [theme, setTheme] = useState<Theme>(getInitialTheme);
+  const [prompts, setPrompts] = useState<SystemPrompt[]>([]);
+  const [systemPromptId, setSystemPromptId] = useState<number | null>(null);
+  const [systemPromptName, setSystemPromptName] = useState('');
+  const [systemPromptText, setSystemPromptText] = useState('');
+  const [singleTurn, setSingleTurn] = useState(false);
+  const [quotedMessages, setQuotedMessages] = useState<Message[]>([]);
+  const [promptLibraryOpen, setPromptLibraryOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [prefs, setPrefs] = useState<Preferences>(loadPreferences);
+  const [darkLock, setDarkLock] = useState(isDarkLocked);
+  const [theme, setTheme] = useState<Theme>(initialTheme);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameValue, setRenameValue] = useState('');
@@ -147,6 +165,7 @@ export default function App() {
 
   const activeIdRef = useRef<number | null>(null);
   const messagesRef = useRef<Message[]>([]);
+  const conversationsRef = useRef<Conversation[]>([]);
   const modelRef = useRef<Model>('deepseek-v4-pro');
   const streamingRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
@@ -171,6 +190,10 @@ export default function App() {
   }, [messages]);
 
   useEffect(() => {
+    conversationsRef.current = conversations;
+  }, [conversations]);
+
+  useEffect(() => {
     modelRef.current = model;
   }, [model]);
 
@@ -184,10 +207,9 @@ export default function App() {
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    localStorage.setItem(THEME_KEY, theme);
     document
       .querySelector('meta[name="theme-color"]')
-      ?.setAttribute('content', theme === 'dark' ? '#17181b' : '#ffffff');
+      ?.setAttribute('content', theme === 'dark' ? '#212327' : '#ffffff');
   }, [theme]);
 
   useEffect(() => {
@@ -205,6 +227,20 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(THINKING_KEY, deepThinking ? '1' : '0');
   }, [deepThinking]);
+
+  const updatePreferences = useCallback((patch: Partial<Preferences>) => {
+    setPrefs((current) => {
+      const next = { ...current, ...patch };
+      savePreferences(next);
+      return next;
+    });
+  }, []);
+
+  const toggleDarkLock = useCallback((locked: boolean) => {
+    setDarkLock(locked);
+    setDarkLocked(locked);
+    if (locked) setTheme('dark');
+  }, []);
 
   useEffect(() => {
     if (auth !== 'in') return;
@@ -239,6 +275,10 @@ export default function App() {
       setConversations((current) => upsertConversation(current, data.conversation));
       setModel(data.conversation.model);
       modelRef.current = data.conversation.model;
+      setSystemPromptId(data.conversation.system_prompt_id ?? null);
+      setSystemPromptName(data.conversation.system_prompt_name ?? '');
+      setSystemPromptText(data.conversation.system_prompt_text ?? '');
+      setSingleTurn(Boolean(data.conversation.single_turn));
     } catch {
       // 刷新失败不影响已经展示的内容，下一次轮询会再试
     }
@@ -257,6 +297,11 @@ export default function App() {
         setConversations((current) => upsertConversation(current, data.conversation));
         setModel(data.conversation.model);
         modelRef.current = data.conversation.model;
+        setSystemPromptId(data.conversation.system_prompt_id ?? null);
+        setSystemPromptName(data.conversation.system_prompt_name ?? '');
+        setSystemPromptText(data.conversation.system_prompt_text ?? '');
+        setSingleTurn(Boolean(data.conversation.single_turn));
+        setQuotedMessages([]);
         setEditingMessage(null);
         setInput('');
       } catch (error) {
@@ -368,6 +413,110 @@ export default function App() {
     [ensureFlashForFiles, showToast],
   );
 
+  const toggleQuote = useCallback(
+    (message: Message) => {
+      if (streamingRef.current || message.status === 'streaming') return;
+      setQuotedMessages((current) => {
+        if (current.some((item) => item.id === message.id)) {
+          return current.filter((item) => item.id !== message.id);
+        }
+        if (current.length >= 8) {
+          showToast('最多引用 8 条消息', 'info');
+          return current;
+        }
+        return [...current, message];
+      });
+    },
+    [showToast],
+  );
+
+  const removeQuote = useCallback((messageId: number) => {
+
+    setQuotedMessages((current) => current.filter((message) => message.id !== messageId));
+  }, []);
+
+  const selectSystemPrompt = useCallback(
+    async (promptId: number | null) => {
+      const conversationId = activeIdRef.current;
+      if (conversationId && messagesRef.current.length > 0) {
+        showToast('对话开始后不能修改系统提示词', 'info');
+        return;
+      }
+      const previous = systemPromptId;
+      setSystemPromptId(promptId);
+      if (!conversationId) {
+        const prompt = prompts.find((item) => item.id === promptId);
+        setSystemPromptName(prompt?.name ?? '');
+        setSystemPromptText(prompt?.content ?? '');
+        return;
+      }
+      try {
+        const { conversation } = await setConversationSettings(conversationId, {
+          system_prompt_id: promptId,
+        });
+        setConversations((current) => upsertConversation(current, conversation));
+        setSystemPromptName(conversation.system_prompt_name ?? '');
+        setSystemPromptText(conversation.system_prompt_text ?? '');
+      } catch (error) {
+        setSystemPromptId(previous);
+        showToast(
+          error instanceof ApiError ? error.message : '设置系统提示词失败',
+          'error',
+        );
+      }
+    },
+    [prompts, showToast, systemPromptId],
+  );
+
+  const toggleSingleTurn = useCallback(
+    async (enabled: boolean) => {
+      const conversationId = activeIdRef.current;
+      if (conversationId && messagesRef.current.length > 0) {
+        showToast('对话开始后不能切换单轮模式', 'info');
+        return;
+      }
+      const previous = singleTurn;
+      setSingleTurn(enabled);
+      if (!conversationId) return;
+      try {
+        const { conversation } = await setConversationSettings(conversationId, {
+          single_turn: enabled,
+        });
+        setConversations((current) => upsertConversation(current, conversation));
+      } catch (error) {
+        setSingleTurn(previous);
+        showToast(
+          error instanceof ApiError ? error.message : '设置单轮对话失败',
+          'error',
+        );
+      }
+    },
+    [showToast, singleTurn],
+  );
+
+  const handlePromptsChanged = useCallback(
+    (nextPrompts: SystemPrompt[]) => {
+      setPrompts(nextPrompts);
+      if (
+        systemPromptId !== null &&
+        !nextPrompts.some((prompt) => prompt.id === systemPromptId)
+      ) {
+        setSystemPromptId(null);
+        if (messagesRef.current.length === 0) {
+          setSystemPromptName('');
+          setSystemPromptText('');
+        }
+      }
+      if (
+        prefs.defaultPromptId !== null &&
+        !nextPrompts.some((prompt) => prompt.id === prefs.defaultPromptId)
+      ) {
+        updatePreferences({ defaultPromptId: null });
+      }
+    },
+    [prefs.defaultPromptId, systemPromptId, updatePreferences],
+  );
+
   const removeAttachment = useCallback(async (attachmentId: string) => {
     pendingAttachmentsRef.current = pendingAttachmentsRef.current.filter(
       (item) => item.id !== attachmentId,
@@ -380,18 +529,81 @@ export default function App() {
     }
   }, []);
 
-  const refreshConversations = useCallback(async (): Promise<Conversation[]> => {
+  const refreshPrompts = useCallback(async (): Promise<SystemPrompt[]> => {
     try {
-      const data = await listConversations();
-      setConversations(data.conversations);
-      return data.conversations;
+      const data = await listPrompts();
+      setPrompts(data.prompts);
+      return data.prompts;
     } catch (error) {
       if (!(error instanceof ApiError && error.status === 401)) {
-        // 轮询失败不打扰用户，下一次会重试
+        showToast('加载提示词库失败', 'error');
       }
       return [];
     }
-  }, []);
+  }, [showToast]);
+
+  const refreshConversations = useCallback(
+    async (reset = false): Promise<Conversation[]> => {
+      try {
+        const loaded = reset
+          ? prefs.searchStep
+          : Math.max(prefs.searchStep, conversationsRef.current.length);
+        const data = await listConversations(loaded, 0);
+        setConversations(data.conversations);
+        setHasMoreConversations(data.has_more);
+        return data.conversations;
+      } catch (error) {
+        if (!(error instanceof ApiError && error.status === 401)) {
+          // 轮询失败不打扰用户，下一次会重试
+        }
+        return [];
+      }
+    },
+    [prefs.searchStep],
+  );
+
+  const loadMoreConversations = useCallback(async () => {
+    if (loadingMoreConversations || !hasMoreConversations) return;
+    setLoadingMoreConversations(true);
+    try {
+      const data = await listConversations(
+        prefs.searchStep,
+        conversationsRef.current.length,
+      );
+      setConversations((current) => {
+        const known = new Set(current.map((conversation) => conversation.id));
+        const merged = [
+          ...current,
+          ...data.conversations.filter((conversation) => !known.has(conversation.id)),
+        ];
+        conversationsRef.current = merged;
+        return merged;
+      });
+      setHasMoreConversations(data.has_more);
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        showToast('加载更多对话失败', 'error');
+      }
+    } finally {
+      setLoadingMoreConversations(false);
+    }
+  }, [hasMoreConversations, loadingMoreConversations, prefs.searchStep, showToast]);
+
+  useEffect(() => {
+    if (auth !== 'in') return;
+    void refreshConversations(true);
+    void refreshPrompts();
+  }, [auth, prefs.searchStep, refreshConversations, refreshPrompts]);
+
+  const applyDefaultNewChatSettings = useCallback(() => {
+    const defaultPrompt =
+      prefs.defaultPromptId !== null &&
+      prompts.some((prompt) => prompt.id === prefs.defaultPromptId)
+        ? prefs.defaultPromptId
+        : null;
+    setSystemPromptId(defaultPrompt);
+    setSingleTurn(prefs.defaultSingleTurn);
+  }, [prefs.defaultPromptId, prefs.defaultSingleTurn, prompts]);
 
   const clearConversation = useCallback(() => {
     discardPendingAttachments();
@@ -403,6 +615,11 @@ export default function App() {
     messagesRef.current = [];
     setEditingMessage(null);
     setHighlightMessageId(null);
+    setQuotedMessages([]);
+    setSystemPromptId(null);
+    setSystemPromptName('');
+    setSystemPromptText('');
+    setSingleTurn(false);
     localStorage.removeItem(LAST_KEY);
     syncUrl(null);
     setInput('');
@@ -440,6 +657,11 @@ export default function App() {
             : normalizeModel(data.conversation.model);
         setModel(nextModel);
         modelRef.current = nextModel;
+        setSystemPromptId(data.conversation.system_prompt_id ?? null);
+        setSystemPromptName(data.conversation.system_prompt_name ?? '');
+        setSystemPromptText(data.conversation.system_prompt_text ?? '');
+        setSingleTurn(Boolean(data.conversation.single_turn));
+        setQuotedMessages([]);
         setEditingMessage(null);
         setInput('');
         setHighlightMessageId(highlightId ?? null);
@@ -471,11 +693,15 @@ export default function App() {
       const target = items.find((item) => item.id === wanted);
       if (target) {
         await openConversation(target.id, false);
+      } else if (wanted > 0) {
+        // 最近对话可能在分页之外，直接按 ID 打开；404 会走正常的清空逻辑。
+        await openConversation(wanted, false);
       } else {
         clearConversation();
+        applyDefaultNewChatSettings();
       }
     },
-    [clearConversation, openConversation],
+    [applyDefaultNewChatSettings, clearConversation, openConversation],
   );
 
   useEffect(() => {
@@ -547,6 +773,10 @@ export default function App() {
           messagesEqual(current, data.messages) ? current : data.messages,
         );
         setConversations((current) => upsertConversation(current, data.conversation));
+        setSystemPromptId(data.conversation.system_prompt_id ?? null);
+        setSystemPromptName(data.conversation.system_prompt_name ?? '');
+        setSystemPromptText(data.conversation.system_prompt_text ?? '');
+        setSingleTurn(Boolean(data.conversation.single_turn));
 
         const stillStreaming = data.messages.some((message) => message.status === 'streaming');
         schedule(stillStreaming ? 1000 : 4000);
@@ -597,6 +827,10 @@ export default function App() {
           setConversations((current) => upsertConversation(current, conversation));
           setModel(meta.model);
           modelRef.current = meta.model;
+          setSystemPromptId(conversation.system_prompt_id ?? null);
+          setSystemPromptName(conversation.system_prompt_name ?? '');
+          setSystemPromptText(conversation.system_prompt_text ?? '');
+          setSingleTurn(Boolean(conversation.single_turn));
           localStorage.setItem(LAST_KEY, String(conversation.id));
           syncUrl(conversation.id);
 
@@ -716,7 +950,13 @@ export default function App() {
 
   const send = useCallback(async () => {
     const content = input.trim();
-    if (!content || streamingRef.current || auth !== 'in' || loadingConversation) return;
+    if (streamingRef.current || auth !== 'in' || loadingConversation) return;
+    if (!content && pendingAttachments.length === 0) {
+      if (quotedMessages.length > 0) {
+        showToast('引用不能单独发送，请同时输入问题或添加附件', 'info');
+      }
+      return;
+    }
     if (messagesRef.current.some((message) => message.status === 'streaming')) {
       showToast('对方正在生成回复，请稍候', 'info');
       return;
@@ -727,6 +967,10 @@ export default function App() {
     }
 
     const editing = editingMessage;
+    if (editing && !content) {
+      showToast('编辑消息不能为空', 'info');
+      return;
+    }
     const conversationId = activeIdRef.current;
     if (editing && !conversationId) {
       cancelEdit();
@@ -740,8 +984,17 @@ export default function App() {
 
     const targetConversationId = conversationId ?? 0;
     const attachmentIds = pendingAttachments.map((attachment) => attachment.id);
+    const quotedMessageIds = quotedMessages.map((message) => message.id);
+    const quoteSnapshots = quotedMessages.map((message) => ({
+      id: message.id,
+      role: message.role,
+      content: message.content,
+    }));
     const userTemp = editing ? null : makeTempMessage(targetConversationId, 'user', content);
-    if (userTemp) userTemp.attachments = pendingAttachments;
+    if (userTemp) {
+      userTemp.attachments = pendingAttachments;
+      userTemp.quotes = quoteSnapshots;
+    }
     const assistantTemp = makeTempMessage(targetConversationId, 'assistant', '');
     assistantTemp.web_search = webSearch;
     assistantTemp.thinking = deepThinking;
@@ -766,6 +1019,7 @@ export default function App() {
     setInput('');
     pendingAttachmentsRef.current = [];
     setPendingAttachments([]);
+    setQuotedMessages([]);
     setStreaming(true);
     streamingRef.current = true;
     stoppedRef.current = false;
@@ -785,6 +1039,7 @@ export default function App() {
           webSearch,
           deepThinking,
           attachmentIds,
+          quotedMessageIds,
           handlers,
           controller.signal,
         );
@@ -796,6 +1051,9 @@ export default function App() {
           webSearch,
           deepThinking,
           attachmentIds,
+          systemPromptId,
+          singleTurn,
+          quotedMessageIds,
           handlers,
           controller.signal,
         );
@@ -834,8 +1092,11 @@ export default function App() {
     input,
     loadingConversation,
     pendingAttachments,
+    quotedMessages,
     refreshConversations,
+    singleTurn,
     showToast,
+    systemPromptId,
     uploadingFiles.length,
     webSearch,
   ]);
@@ -936,8 +1197,9 @@ export default function App() {
       return;
     }
     clearConversation();
+    applyDefaultNewChatSettings();
     setSidebarOpen(false);
-  }, [clearConversation, showToast]);
+  }, [applyDefaultNewChatSettings, clearConversation, showToast]);
 
   const selectConversation = useCallback(
     (conversationId: number) => {
@@ -1119,17 +1381,19 @@ export default function App() {
         conversations={conversations}
         activeId={activeId}
         open={sidebarOpen}
-        theme={theme}
+        hasMore={hasMoreConversations}
+        loadingMore={loadingMoreConversations}
         onClose={closeSidebar}
         onNew={newChat}
         onSearch={() => setSearchOpen(true)}
+        onLoadMore={() => void loadMoreConversations()}
         onSelect={selectConversation}
         onRename={(conversation) => {
           setRenameTarget(conversation);
           setRenameValue(conversation.title);
         }}
         onDelete={setDeleteTarget}
-        onToggleTheme={() => setTheme((value) => (value === 'light' ? 'dark' : 'light'))}
+        onSettings={() => setSettingsOpen(true)}
         onLogout={handleLogout}
       />
       {sidebarOpen && (
@@ -1149,6 +1413,16 @@ export default function App() {
           messages={messages}
           model={model}
           streaming={isGenerating}
+          systemPromptId={systemPromptId}
+          systemPromptName={systemPromptName}
+          systemPromptText={systemPromptText}
+          singleTurn={singleTurn}
+          prompts={prompts}
+          quotedMessageIds={quotedMessages.map((message) => message.id)}
+          showTokenUsage={prefs.showTokenUsage}
+          showAssistantIdentity={prefs.showAssistantIdentity}
+          showChatTitle={prefs.showChatTitle}
+          showSystemPromptMessage={prefs.showSystemPromptMessage}
           onOpenSidebar={openSidebar}
           onModelChange={changeModel}
           onRegenerate={() => void regenerate()}
@@ -1156,6 +1430,13 @@ export default function App() {
           onSuggestion={handleSuggestion}
           onEdit={startEdit}
           onSwitchVersion={(messageId) => void switchVersion(messageId)}
+          onToggleQuote={toggleQuote}
+          onSelectPrompt={(promptId) => void selectSystemPrompt(promptId)}
+          onToggleSingleTurn={(enabled) => void toggleSingleTurn(enabled)}
+          onManagePrompts={() => {
+            setPromptLibraryOpen(true);
+            void refreshPrompts();
+          }}
           highlightMessageId={highlightMessageId}
         />
         <Composer
@@ -1173,8 +1454,10 @@ export default function App() {
           onToggleDeepThinking={toggleDeepThinking}
           attachments={pendingAttachments}
           uploadingFiles={uploadingFiles}
+          quotedMessages={quotedMessages}
           onAddFiles={(files) => void handleFiles(files)}
           onRemoveAttachment={(id) => void removeAttachment(id)}
+          onRemoveQuote={removeQuote}
           maxAttachments={MAX_ATTACHMENTS}
         />
       </main>
@@ -1227,8 +1510,35 @@ export default function App() {
         </p>
       </Modal>
 
+      <SettingsDialog
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        theme={theme}
+        onThemeChange={(dark) => setTheme(dark ? 'dark' : 'light')}
+        darkLock={darkLock}
+        onDarkLockChange={toggleDarkLock}
+        preferences={prefs}
+        onPreferencesChange={updatePreferences}
+        prompts={prompts}
+        onManagePrompts={() => {
+          setSettingsOpen(false);
+          setPromptLibraryOpen(true);
+          void refreshPrompts();
+        }}
+        onLogout={handleLogout}
+      />
+
+      <PromptLibrary
+        open={promptLibraryOpen}
+        prompts={prompts}
+        onClose={() => setPromptLibraryOpen(false)}
+        onPromptsChanged={handlePromptsChanged}
+        onError={(message) => showToast(message, 'error')}
+      />
+
       <SearchDialog
         open={searchOpen}
+        step={prefs.searchStep}
         onClose={() => setSearchOpen(false)}
         onSelect={handleSearchSelect}
       />

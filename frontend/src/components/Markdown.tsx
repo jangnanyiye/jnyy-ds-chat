@@ -4,9 +4,43 @@ import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import hljs from 'highlight.js/lib/common';
-import 'highlight.js/styles/atom-one-dark.css';
+import 'highlight.js/styles/github.css';
 import 'katex/dist/katex.min.css';
 import { Check, Copy } from 'lucide-react';
+
+function normalizeMath(source: string): string {
+  // 模型经常会输出 \[...\]、\(...\)，甚至只带方括号/圆括号的 LaTeX。
+  // 这里把它们规范成 remark-math 能识别的 $$...$$ / $...$。
+  // 跳过 fenced code 和 inline code，避免改坏代码示例。
+  const parts = source.split(/(```[\s\S]*?```|`[^`\n]*`)/g);
+  return parts
+    .map((part, index) => {
+      if (index % 2 === 1) return part;
+      let text = part;
+      text = text.replace(
+        /\\\[([\s\S]*?)\\\]/g,
+        (_match, expression: string) => `\n\n$$\n${expression.trim()}\n$$\n\n`,
+      );
+      text = text.replace(
+        /\\\(([\s\S]*?)\\\)/g,
+        (_match, expression: string) => `$${expression.trim()}$`,
+      );
+      text = text.replace(
+        /^[ \t]*\[([^\n]*\\[A-Za-z]+[^\n]*)\][ \t]*$/gm,
+        (_match, expression: string) => `\n$$\n${expression.trim()}\n$$\n`,
+      );
+      text = text.replace(
+        /\[([^\[\]\n]*\\[A-Za-z]+[^\[\]\n]*)\]/g,
+        (_match, expression: string) => `$${expression.trim()}$`,
+      );
+      text = text.replace(
+        /\(([^()\n]*\\[A-Za-z]+[^()\n]*)\)/g,
+        (_match, expression: string) => `$${expression.trim()}$`,
+      );
+      return text;
+    })
+    .join('');
+}
 
 function escapeHtml(value: string): string {
   return value
@@ -92,7 +126,7 @@ export function Markdown({ content }: { content: string }) {
         rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
         components={components}
       >
-        {content}
+        {normalizeMath(content)}
       </ReactMarkdown>
     </div>
   );

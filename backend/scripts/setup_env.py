@@ -2,7 +2,7 @@
 """交互式生成 /etc/ds-chat.env。
 
 用法（服务器 root）：
-    /opt/ds-chat/venv/bin/python /opt/ds-chat/backend/scripts/setup_env.py
+    /opt/ds-chat/venv/bin/python /opt/ds-chat/scripts/setup_env.py
 """
 
 from __future__ import annotations
@@ -83,13 +83,12 @@ def main() -> int:
             f"SESSION_SECRET={session_secret}",
             f"PUBLIC_ORIGIN={origin}",
             "DB_PATH=/var/lib/ds-chat/chat.db",
-            "UPLOAD_DIR=/var/lib/ds-chat/uploads",
             "COOKIE_SECURE=true",
             "COOKIE_NAME=__Host-ds_session",
             "SESSION_TTL=2592000",
             "MAX_CONTEXT_CHARS=60000",
             "MAX_OUTPUT_TOKENS=8192",
-            "UPSTREAM_TIMEOUT=300",
+            "UPSTREAM_TIMEOUT=1800",
             "",
         ]
     )

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import secrets
 import sys
 from pathlib import Path
 
@@ -14,20 +13,14 @@ from app.auth import hash_password  # noqa: E402
 from app.config import Settings  # noqa: E402
 from app.main import create_app  # noqa: E402
 
-# 运行时生成，避免仓库里出现任何看起来像真实密码的固定字符串。
-TEST_PASSWORD = "test-fixture-" + secrets.token_hex(16)
-
-
-@pytest.fixture
-def access_password() -> str:
-    return TEST_PASSWORD
+TEST_PASSWORD = "correct-horse-battery-staple"
 
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     return Settings(
         db_path=tmp_path / "test.db",
-        deepseek_api_key="test-key-not-real",
+        deepseek_api_key="sk-test",
         password_hash=hash_password(TEST_PASSWORD),
         session_secret="s" * 64,
         cookie_secure=False,
